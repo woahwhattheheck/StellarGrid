@@ -2,9 +2,52 @@ import { create } from "zustand"
 import { deobfuscateWords } from "@/utils/wordObfuscation"
 import { createMatch, joinMatch, confirmStake, submitScore, getMatch, listOpenMatches } from "@/lib/match-actions"
 import { supabase } from "@/lib/supabase"
+import type { RealtimeChannel } from "@supabase/supabase-js"
 
 // Match-scoped Zustand store, parallel to (not merged with) stores/gameStore.ts.
 // The existing daily single-player puzzle path is untouched by this store.
+
+let activeMatchChannel: RealtimeChannel | null = null
+let activeMatchChannelId: string | null = null
+let progressSyncChain: Promise<void> = Promise.resolve()
+
+function persistLiveMatchProgress(matchId: string, userId: string, score: number, foundWords: string[]) {
+  progressSyncChain = progressSyncChain
+    .then(async () => {
+      const { error } = await supabase
+        .from("match_participants")
+        .update({
+          score,
+          found_words: foundWords,
+          connection_status: "connected",
+        })
+        .eq("match_id", matchId)
+        .eq("user_id", userId)
+
+      if (error) {
+        throw error
+      }
+    })
+    .catch((error) => {
+      console.error("Failed to persist live match progress:", error)
+    })
+}
+
+async function persistConnectionStatus(
+  matchId: string,
+  userId: string,
+  connectionStatus: "connected" | "disconnected",
+) {
+  const { error } = await supabase
+    .from("match_participants")
+    .update({ connection_status: connectionStatus })
+    .eq("match_id", matchId)
+    .eq("user_id", userId)
+
+  if (error) {
+    console.error(`Failed to persist ${connectionStatus} match presence:`, error)
+  }
+}
 
 export type MatchStatus =
   | "created"
@@ -181,18 +224,27 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
   addFoundWord: (word, points) => {
     const { foundWords, score, matchId, currentUserId } = get()
     if (foundWords.includes(word)) return
-    const newScore = score + points
-    set({ foundWords: [...foundWords, word], score: newScore })
 
-    // Broadcast score/count only (never the found-words list) so the
-    // opponent can't see which specific words were found, per the plan's
-    // anti-leakage note. Best-effort — a dropped broadcast just means the
-    // opponent's live view lags until the next update or match end.
+    const newFoundWords = [...foundWords, word]
+    const newScore = score + points
+    set({ foundWords: newFoundWords, score: newScore })
+
     if (matchId && currentUserId) {
-      supabase.channel(`match:${matchId}`).send({
+      // Keep the latest score/word list durable while the match is active so
+      // a browser disconnect does not erase the last progress the server saw.
+      // Writes are serialized to prevent an older request winning a race.
+      persistLiveMatchProgress(matchId, currentUserId, newScore, newFoundWords)
+
+      // Opponents receive score/count only; the word list remains off the
+      // broadcast channel.
+      const channel =
+        activeMatchChannelId === matchId && activeMatchChannel
+          ? activeMatchChannel
+          : supabase.channel(`match:${matchId}`)
+      void channel.send({
         type: "broadcast",
         event: "score_update",
-        payload: { userId: currentUserId, score: newScore, wordsFound: foundWords.length + 1 },
+        payload: { userId: currentUserId, score: newScore, wordsFound: newFoundWords.length },
       })
     }
   },
@@ -210,26 +262,74 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
     await get().loadMatch(matchId, userId)
   },
 
-  // Realtime channel: one per match, broadcasting opponent score/status updates.
-  // Returns an unsubscribe function. See app/api/matches for server-side settle triggers.
+  // One Realtime channel per match: score broadcasts, lifecycle transitions,
+  // and Supabase Presence replace the former 3-second status polling loop.
   subscribeToMatch: (matchId, currentUserId) => {
     const channel = supabase
-      .channel(`match:${matchId}`)
+      .channel(`match:${matchId}`, {
+        config: { presence: { key: currentUserId } },
+      })
+      .on("presence", { event: "sync" }, () => {
+        const presentUsers = new Set(Object.keys(channel.presenceState()))
+        set((state) => ({
+          opponent: state.opponent
+            ? {
+                ...state.opponent,
+                connectionStatus: presentUsers.has(state.opponent.userId) ? "connected" : "disconnected",
+              }
+            : null,
+        }))
+      })
       .on("broadcast", { event: "score_update" }, ({ payload }) => {
         if (payload.userId === currentUserId) return
         set((state) => ({
           opponent: state.opponent
-            ? { ...state.opponent, score: payload.score }
-            : { userId: payload.userId, score: payload.score, connectionStatus: "connected", staked: true, submitted: false },
+            ? { ...state.opponent, score: payload.score, connectionStatus: "connected" }
+            : {
+                userId: payload.userId,
+                score: payload.score,
+                connectionStatus: "connected",
+                staked: true,
+                submitted: false,
+              },
+        }))
+      })
+      .on("broadcast", { event: "opponent_joined" }, () => {
+        void get().loadMatch(matchId, currentUserId)
+      })
+      .on("broadcast", { event: "stake_confirmed" }, () => {
+        void get().loadMatch(matchId, currentUserId)
+      })
+      .on("broadcast", { event: "match_started" }, ({ payload }) => {
+        set((state) => ({
+          status: "active",
+          startedAt: payload.startedAt,
+          endsAt: payload.endsAt,
+          myStaked: true,
+          opponent: state.opponent ? { ...state.opponent, staked: true } : state.opponent,
         }))
       })
       .on("broadcast", { event: "match_ended" }, () => {
-        get().loadMatch(matchId, currentUserId)
+        void get().loadMatch(matchId, currentUserId)
       })
-      .subscribe()
+
+    activeMatchChannel = channel
+    activeMatchChannelId = matchId
+
+    channel.subscribe((status) => {
+      if (status !== "SUBSCRIBED") return
+      void channel.track({ userId: currentUserId, connectedAt: new Date().toISOString() })
+      void persistConnectionStatus(matchId, currentUserId, "connected")
+    })
 
     return () => {
-      supabase.removeChannel(channel)
+      if (activeMatchChannel === channel) {
+        activeMatchChannel = null
+        activeMatchChannelId = null
+      }
+      void persistConnectionStatus(matchId, currentUserId, "disconnected")
+      void channel.untrack()
+      void supabase.removeChannel(channel)
     }
   },
 
