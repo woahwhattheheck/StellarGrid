@@ -3,7 +3,7 @@
 import { supabase } from "@/lib/supabase"
 import { supabaseAdmin } from "@/lib/supabase-admin"
 import { getEscrowClient } from "@/lib/soroban/escrowClient"
-import { generateRandomSeed, generateBoardFromSeed } from "@/lib/boardGenerator"
+import { generateRandomSeed, generateBoardFromSeed, findWordsOnBoard } from "@/lib/boardGenerator"
 import { words3 } from "@/utils/words3"
 import { obfuscateWords } from "@/utils/wordObfuscation"
 
@@ -15,13 +15,14 @@ import { obfuscateWords } from "@/utils/wordObfuscation"
 // client writes to. See supabase-staked-matches-table.sql for the schema
 // and RLS policies this respects.
 //
-// Anti-cheat note: submitted scores/found_words are trusted as-is in this
-// Phase 1 slice, same trust level as the existing daily-game flow. Re-validating
-// submissions against board_snapshot server-side before settlement is tracked
-// as a follow-up contributor issue ("Anti-cheat hardening").
+// Staked-match submissions are revalidated against the persisted board before
+// they can affect settlement. Invalid words remain visible only in the
+// word_attempts audit trail; participant score/found_words use server results.
 
 const MATCH_DURATION_MS = 3 * 60 * 1000 // 3 minutes per match
 const STAKE_WINDOW_MS = 2 * 60 * 1000 // 2 minutes to both stake before refund-eligible
+const MIN_MATCH_WORD_LENGTH = 4
+const IMPOSSIBLE_AVERAGE_WORD_MS = 150
 
 export interface BoardSnapshot {
   board: string[][]
@@ -187,6 +188,26 @@ export async function confirmStake(matchId: string, userId: string) {
   }
 }
 
+function normalizeSubmittedWords(foundWords: string[]): string[] {
+  const unique = new Set<string>()
+  for (const candidate of foundWords) {
+    if (typeof candidate !== "string") continue
+    const word = candidate.trim().toUpperCase()
+    if (word) unique.add(word)
+  }
+  return Array.from(unique)
+}
+
+function scoreMatchWords(words: string[]): number {
+  return words.reduce((total, word) => total + word.length, 0)
+}
+
+function matchGameDate(createdAt: string | null | undefined): string {
+  const parsed = createdAt ? new Date(createdAt) : new Date()
+  const date = Number.isNaN(parsed.getTime()) ? new Date() : parsed
+  return date.toISOString().slice(0, 10)
+}
+
 export async function submitScore(
   matchId: string,
   userId: string,
@@ -194,9 +215,81 @@ export async function submitScore(
   foundWords: string[],
 ) {
   try {
+    const submittedAt = new Date()
+    const { data: match, error: matchError } = await supabaseAdmin
+      .from("matches")
+      .select("id, status, board_snapshot, created_at, started_at, ends_at")
+      .eq("id", matchId)
+      .single()
+
+    if (matchError || !match) {
+      return { success: false, error: matchError?.message ?? "Match not found" }
+    }
+
+    const board = (match.board_snapshot as BoardSnapshot | null)?.board
+    if (!Array.isArray(board) || board.length !== 4 || board.some((row) => !Array.isArray(row) || row.length !== 4)) {
+      return { success: false, error: "Match board snapshot is invalid" }
+    }
+
+    const submittedWords = normalizeSubmittedWords(foundWords)
+    const dictionary = new Set(words3.map((word) => word.trim().toUpperCase()))
+    const dictionaryCandidates = submittedWords.filter(
+      (word) => word.length >= MIN_MATCH_WORD_LENGTH && dictionary.has(word),
+    )
+    const boardValidWords = findWordsOnBoard(board, dictionaryCandidates)
+    const validWords = dictionaryCandidates.filter((word) => boardValidWords.has(word))
+    const validSet = new Set(validWords)
+    const invalidWords = submittedWords.filter((word) => !validSet.has(word))
+    const serverScore = scoreMatchWords(validWords)
+
+    const attempts = submittedWords.map((word) => ({
+      user_id: userId,
+      match_id: matchId,
+      game_date: matchGameDate(match.created_at),
+      word,
+      is_valid: validSet.has(word),
+      word_type: validSet.has(word)
+        ? "match_valid"
+        : word.length < MIN_MATCH_WORD_LENGTH
+          ? "too_short"
+          : "invalid",
+      attempted_at: submittedAt.toISOString(),
+    }))
+
+    if (attempts.length > 0) {
+      const { error: attemptError } = await supabaseAdmin.from("word_attempts").insert(attempts)
+      if (attemptError) {
+        return { success: false, error: `Failed to log validated attempts: ${attemptError.message}` }
+      }
+    }
+
+    const startedAtMs = match.started_at ? new Date(match.started_at).getTime() : Number.NaN
+    const elapsedMs = Number.isFinite(startedAtMs)
+      ? Math.max(0, submittedAt.getTime() - startedAtMs)
+      : null
+    const impossibleSolveRate =
+      elapsedMs !== null &&
+      validWords.length >= 5 &&
+      elapsedMs < validWords.length * IMPOSSIBLE_AVERAGE_WORD_MS
+    const scoreMismatch = !Number.isFinite(score) || score !== serverScore
+
+    if (invalidWords.length > 0 || impossibleSolveRate || scoreMismatch) {
+      await logMatchEvent(matchId, "anti_cheat_flag", {
+        userId,
+        submittedWordCount: submittedWords.length,
+        acceptedWordCount: validWords.length,
+        rejectedWordCount: invalidWords.length,
+        clientScore: score,
+        serverScore,
+        scoreMismatch,
+        impossibleSolveRate,
+        elapsedMs,
+      })
+    }
+
     const { error: submitError } = await supabaseAdmin
       .from("match_participants")
-      .update({ score, found_words: foundWords, submitted_at: new Date().toISOString() })
+      .update({ score: serverScore, found_words: validWords, submitted_at: submittedAt.toISOString() })
       .eq("match_id", matchId)
       .eq("user_id", userId)
 
@@ -204,7 +297,12 @@ export async function submitScore(
       return { success: false, error: submitError.message }
     }
 
-    await logMatchEvent(matchId, "submitted", { userId, score })
+    await logMatchEvent(matchId, "submitted", {
+      userId,
+      score: serverScore,
+      acceptedWordCount: validWords.length,
+      rejectedWordCount: invalidWords.length,
+    })
 
     const { data: participants, error: fetchError } = await supabaseAdmin
       .from("match_participants")
@@ -215,11 +313,6 @@ export async function submitScore(
       return { success: false, error: fetchError?.message ?? "Could not load participants" }
     }
 
-    const { data: match } = await supabaseAdmin.from("matches").select("*").eq("id", matchId).single()
-    if (!match) {
-      return { success: false, error: "Match not found" }
-    }
-
     const bothSubmitted = participants.length === 2 && participants.every((p) => p.submitted_at)
     const timerExpired = match.ends_at && new Date(match.ends_at) < new Date()
 
@@ -227,7 +320,7 @@ export async function submitScore(
       return await settleMatch(matchId)
     }
 
-    return { success: true }
+    return { success: true, score: serverScore, foundWords: validWords }
   } catch (error) {
     console.error("Error in submitScore:", error)
     return { success: false, error: "Failed to submit score" }
