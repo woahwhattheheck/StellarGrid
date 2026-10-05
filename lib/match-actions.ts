@@ -2,6 +2,7 @@
 
 import { supabase } from "@/lib/supabase"
 import { supabaseAdmin } from "@/lib/supabase-admin"
+import { broadcastMatchTransition } from "@/lib/match-realtime"
 import { getEscrowClient } from "@/lib/soroban/escrowClient"
 import { generateRandomSeed, generateBoardFromSeed } from "@/lib/boardGenerator"
 import { words3 } from "@/utils/words3"
@@ -131,6 +132,7 @@ export async function joinMatch(matchId: string, userId: string) {
     }
 
     await logMatchEvent(matchId, "opponent_joined", { userId })
+    await broadcastMatchTransition(matchId, "opponent_joined", { userId, status: "awaiting_stakes" })
 
     return { success: true, data }
   } catch (error) {
@@ -160,6 +162,7 @@ export async function confirmStake(matchId: string, userId: string) {
     }
 
     await logMatchEvent(matchId, "staked", { userId, txHash })
+    await broadcastMatchTransition(matchId, "stake_confirmed", { userId })
 
     if (escrowState.status === "Funded") {
       const startedAt = new Date()
@@ -177,6 +180,10 @@ export async function confirmStake(matchId: string, userId: string) {
       }
 
       await logMatchEvent(matchId, "match_started", { startedAt, endsAt })
+      await broadcastMatchTransition(matchId, "match_started", {
+        startedAt: startedAt.toISOString(),
+        endsAt: endsAt.toISOString(),
+      })
       return { success: true, data, escrowState }
     }
 
@@ -268,6 +275,9 @@ export async function settleMatch(matchId: string) {
       .single()
 
     await logMatchEvent(matchId, "tie_refunded", {})
+    if (!error) {
+      await broadcastMatchTransition(matchId, "match_ended", { status: "refunded", winnerUserId: null })
+    }
     return { success: !error, data, error: error?.message }
   }
 
@@ -285,6 +295,11 @@ export async function settleMatch(matchId: string) {
   }
 
   await logMatchEvent(matchId, "settled", { winnerUserId: winner.user_id, txHash })
+  await broadcastMatchTransition(matchId, "match_ended", {
+    status: "settled",
+    winnerUserId: winner.user_id,
+    payoutTxHash: txHash,
+  })
 
   return { success: true, data }
 }
@@ -353,6 +368,9 @@ export async function reconcileMatch(matchId: string) {
           .single()
 
         await logMatchEvent(matchId, "stake_deadline_refunded", {})
+        if (!updateError) {
+          await broadcastMatchTransition(matchId, "match_ended", { status: "refunded", winnerUserId: null })
+        }
         return { success: !updateError, data, error: updateError?.message }
       }
     }
