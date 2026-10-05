@@ -19,7 +19,6 @@ function persistLiveMatchProgress(matchId: string, userId: string, score: number
         .update({
           score,
           found_words: foundWords,
-          connection_status: "connected",
         })
         .eq("match_id", matchId)
         .eq("user_id", userId)
