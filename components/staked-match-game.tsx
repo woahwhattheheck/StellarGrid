@@ -58,17 +58,6 @@ export function StakedMatchGame({ matchId }: StakedMatchGameProps) {
     }
   }, [matchId, user, loadMatch, subscribeToMatch, reset])
 
-  // Poll for opponent stake/match-start transitions and timer expiry while
-  // waiting/playing — Realtime broadcast covers score updates, but status
-  // transitions (funded -> active, active -> settled) are re-fetched here.
-  // Contributors: see "Realtime sync polish" issue for replacing this with
-  // dedicated broadcast events for every status transition.
-  useEffect(() => {
-    if (!user || status === "settled" || status === "refunded") return
-    const interval = setInterval(() => loadMatch(matchId, user.id), 3000)
-    return () => clearInterval(interval)
-  }, [matchId, user, status, loadMatch])
-
   useEffect(() => {
     if (status !== "active" || !endsAt || !user) return
     const msLeft = new Date(endsAt).getTime() - Date.now()
