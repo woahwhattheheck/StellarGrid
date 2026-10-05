@@ -2,17 +2,22 @@
 CREATE TABLE IF NOT EXISTS public.word_attempts (
   id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
   user_id UUID REFERENCES auth.users(id) ON DELETE SET NULL,
+  match_id UUID, -- Nullable; populated for staked-match attempts
   game_date DATE NOT NULL,
   word VARCHAR(50) NOT NULL,
   is_valid BOOLEAN NOT NULL DEFAULT false,
-  word_type VARCHAR(20) NOT NULL, -- 'target', 'bonus', 'invalid', 'too_short'
+  word_type VARCHAR(20) NOT NULL, -- 'target', 'bonus', 'match_valid', 'invalid', 'too_short'
   ip_address VARCHAR(15), -- Truncated for privacy
   attempted_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
+-- Existing deployments need the new nullable column as well as fresh installs.
+ALTER TABLE public.word_attempts ADD COLUMN IF NOT EXISTS match_id UUID;
+
 -- Create indexes for performance
 CREATE INDEX IF NOT EXISTS idx_word_attempts_user_date ON public.word_attempts(user_id, game_date);
+CREATE INDEX IF NOT EXISTS idx_word_attempts_match_id ON public.word_attempts(match_id);
 CREATE INDEX IF NOT EXISTS idx_word_attempts_date ON public.word_attempts(game_date);
 CREATE INDEX IF NOT EXISTS idx_word_attempts_word_type ON public.word_attempts(word_type);
 CREATE INDEX IF NOT EXISTS idx_word_attempts_attempted_at ON public.word_attempts(attempted_at);
