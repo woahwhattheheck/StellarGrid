@@ -317,6 +317,7 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
 
     channel.subscribe((status) => {
       if (status !== "SUBSCRIBED") return
+      void get().loadMatch(matchId, currentUserId)
       void channel.track({ userId: currentUserId, connectedAt: new Date().toISOString() })
       void persistConnectionStatus(matchId, currentUserId, "connected")
     })
