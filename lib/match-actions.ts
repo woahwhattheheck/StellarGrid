@@ -211,10 +211,20 @@ function matchGameDate(createdAt: string | null | undefined): string {
 export async function submitScore(
   matchId: string,
   userId: string,
+  accessToken: string,
   score: number,
   foundWords: string[],
 ) {
   try {
+    const {
+      data: { user },
+      error: authError,
+    } = await supabaseAdmin.auth.getUser(accessToken)
+
+    if (authError || !user || user.id !== userId) {
+      return { success: false, error: "Unauthorized score submission" }
+    }
+
     const submittedAt = new Date()
     const { data: match, error: matchError } = await supabaseAdmin
       .from("matches")
@@ -224,6 +234,20 @@ export async function submitScore(
 
     if (matchError || !match) {
       return { success: false, error: matchError?.message ?? "Match not found" }
+    }
+    if (match.status !== "active") {
+      return { success: false, error: "Match is not active" }
+    }
+
+    const { data: participant, error: participantError } = await supabaseAdmin
+      .from("match_participants")
+      .select("user_id")
+      .eq("match_id", matchId)
+      .eq("user_id", userId)
+      .maybeSingle()
+
+    if (participantError || !participant) {
+      return { success: false, error: "Authenticated user is not a participant in this match" }
     }
 
     const board = (match.board_snapshot as BoardSnapshot | null)?.board
@@ -292,6 +316,8 @@ export async function submitScore(
       .update({ score: serverScore, found_words: validWords, submitted_at: submittedAt.toISOString() })
       .eq("match_id", matchId)
       .eq("user_id", userId)
+      .select("user_id")
+      .single()
 
     if (submitError) {
       return { success: false, error: submitError.message }
