@@ -241,13 +241,16 @@ export async function submitScore(
 
     const { data: participant, error: participantError } = await supabaseAdmin
       .from("match_participants")
-      .select("user_id")
+      .select("user_id, submitted_at")
       .eq("match_id", matchId)
       .eq("user_id", userId)
       .maybeSingle()
 
     if (participantError || !participant) {
       return { success: false, error: "Authenticated user is not a participant in this match" }
+    }
+    if (participant.submitted_at) {
+      return { success: false, error: "Score has already been submitted" }
     }
 
     const board = (match.board_snapshot as BoardSnapshot | null)?.board
@@ -311,16 +314,20 @@ export async function submitScore(
       })
     }
 
-    const { error: submitError } = await supabaseAdmin
+    const { data: submittedParticipant, error: submitError } = await supabaseAdmin
       .from("match_participants")
       .update({ score: serverScore, found_words: validWords, submitted_at: submittedAt.toISOString() })
       .eq("match_id", matchId)
       .eq("user_id", userId)
+      .is("submitted_at", null)
       .select("user_id")
-      .single()
+      .maybeSingle()
 
     if (submitError) {
       return { success: false, error: submitError.message }
+    }
+    if (!submittedParticipant) {
+      return { success: false, error: "Score has already been submitted" }
     }
 
     await logMatchEvent(matchId, "submitted", {
