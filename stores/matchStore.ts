@@ -201,7 +201,18 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
     const { matchId, score, foundWords } = get()
     if (!matchId) return
     set({ loading: true, error: null })
-    const result = await submitScore(matchId, userId, score, foundWords)
+
+    const {
+      data: { session },
+      error: sessionError,
+    } = await supabase.auth.getSession()
+
+    if (sessionError || !session?.access_token || session.user.id !== userId) {
+      set({ loading: false, error: "You must be signed in as this match participant to submit a score" })
+      return
+    }
+
+    const result = await submitScore(matchId, userId, session.access_token, score, foundWords)
     set({ loading: false })
     if (!result.success) {
       set({ error: result.error ?? "Failed to submit score" })
