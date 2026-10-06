@@ -1,6 +1,14 @@
 import { create } from "zustand"
 import { deobfuscateWords } from "@/utils/wordObfuscation"
-import { createMatch, joinMatch, confirmStake, submitScore, getMatch, listOpenMatches } from "@/lib/match-actions"
+import {
+  createMatch,
+  joinMatch,
+  confirmStake,
+  submitScore,
+  getMatch,
+  listOpenMatches,
+  syncLiveMatchProgress,
+} from "@/lib/match-actions"
 import { supabase } from "@/lib/supabase"
 import type { RealtimeChannel } from "@supabase/supabase-js"
 
@@ -11,20 +19,12 @@ let activeMatchChannel: RealtimeChannel | null = null
 let activeMatchChannelId: string | null = null
 let progressSyncChain: Promise<void> = Promise.resolve()
 
-function persistLiveMatchProgress(matchId: string, userId: string, score: number, foundWords: string[]) {
+function persistLiveMatchProgress(matchId: string, userId: string, foundWords: string[]) {
   progressSyncChain = progressSyncChain
     .then(async () => {
-      const { error } = await supabase
-        .from("match_participants")
-        .update({
-          score,
-          found_words: foundWords,
-        })
-        .eq("match_id", matchId)
-        .eq("user_id", userId)
-
-      if (error) {
-        throw error
+      const result = await syncLiveMatchProgress(matchId, userId, foundWords)
+      if (!result.success) {
+        throw new Error(result.error ?? "Failed to sync live match progress")
       }
     })
     .catch((error) => {
@@ -229,10 +229,11 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
     set({ foundWords: newFoundWords, score: newScore })
 
     if (matchId && currentUserId) {
-      // Keep the latest score/word list durable while the match is active so
-      // a browser disconnect does not erase the last progress the server saw.
+      // Keep the latest word list durable while the match is active so a
+      // browser disconnect does not erase the last progress the server saw.
+      // The server revalidates the words and writes score/found_words itself.
       // Writes are serialized to prevent an older request winning a race.
-      persistLiveMatchProgress(matchId, currentUserId, newScore, newFoundWords)
+      persistLiveMatchProgress(matchId, currentUserId, newFoundWords)
 
       // Opponents receive score/count only; the word list remains off the
       // broadcast channel.

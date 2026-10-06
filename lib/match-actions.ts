@@ -4,7 +4,7 @@ import { supabase } from "@/lib/supabase"
 import { supabaseAdmin } from "@/lib/supabase-admin"
 import { broadcastMatchTransition } from "@/lib/match-realtime"
 import { getEscrowClient } from "@/lib/soroban/escrowClient"
-import { generateRandomSeed, generateBoardFromSeed } from "@/lib/boardGenerator"
+import { generateRandomSeed, generateBoardFromSeed, findWordsOnBoard } from "@/lib/boardGenerator"
 import { words3 } from "@/utils/words3"
 import { obfuscateWords } from "@/utils/wordObfuscation"
 
@@ -16,13 +16,16 @@ import { obfuscateWords } from "@/utils/wordObfuscation"
 // client writes to. See supabase-staked-matches-table.sql for the schema
 // and RLS policies this respects.
 //
-// Anti-cheat note: submitted scores/found_words are trusted as-is in this
-// Phase 1 slice, same trust level as the existing daily-game flow. Re-validating
-// submissions against board_snapshot server-side before settlement is tracked
-// as a follow-up contributor issue ("Anti-cheat hardening").
+// Final submitScore() still records the client score in this slice. Live
+// progress used by timeout settlement is revalidated in syncLiveMatchProgress
+// against the persisted board before score/found_words are written.
+// MIN_MATCH_WORD_LENGTH, normalizeSubmittedWords, scoreMatchWords, and
+// findWordsOnBoard match the staked-match submit validator so the two paths
+// can be deduplicated when that change lands.
 
 const MATCH_DURATION_MS = 3 * 60 * 1000 // 3 minutes per match
 const STAKE_WINDOW_MS = 2 * 60 * 1000 // 2 minutes to both stake before refund-eligible
+const MIN_MATCH_WORD_LENGTH = 4
 
 export interface BoardSnapshot {
   board: string[][]
@@ -191,6 +194,71 @@ export async function confirmStake(matchId: string, userId: string) {
   } catch (error) {
     console.error("Error in confirmStake:", error)
     return { success: false, error: "Failed to confirm stake" }
+  }
+}
+
+function normalizeSubmittedWords(foundWords: string[]): string[] {
+  const unique = new Set<string>()
+  for (const candidate of foundWords) {
+    if (typeof candidate !== "string") continue
+    const word = candidate.trim().toUpperCase()
+    if (word) unique.add(word)
+  }
+  return Array.from(unique)
+}
+
+function scoreMatchWords(words: string[]): number {
+  return words.reduce((total, word) => total + word.length, 0)
+}
+
+export async function syncLiveMatchProgress(matchId: string, userId: string, foundWords: string[]) {
+  try {
+    const { data: match, error: matchError } = await supabaseAdmin
+      .from("matches")
+      .select("id, status, board_snapshot")
+      .eq("id", matchId)
+      .single()
+
+    if (matchError || !match) {
+      return { success: false, error: matchError?.message ?? "Match not found" }
+    }
+    if (match.status !== "active") {
+      return { success: false, error: "Match is not active" }
+    }
+
+    const board = (match.board_snapshot as BoardSnapshot | null)?.board
+    if (!Array.isArray(board) || board.length !== 4 || board.some((row) => !Array.isArray(row) || row.length !== 4)) {
+      return { success: false, error: "Match board snapshot is invalid" }
+    }
+
+    const submittedWords = normalizeSubmittedWords(foundWords)
+    const dictionary = new Set(words3.map((word) => word.trim().toUpperCase()))
+    const dictionaryCandidates = submittedWords.filter(
+      (word) => word.length >= MIN_MATCH_WORD_LENGTH && dictionary.has(word),
+    )
+    const boardValidWords = findWordsOnBoard(board, dictionaryCandidates)
+    const validWords = dictionaryCandidates.filter((word) => boardValidWords.has(word))
+    const serverScore = scoreMatchWords(validWords)
+
+    const { data: updated, error: updateError } = await supabaseAdmin
+      .from("match_participants")
+      .update({ score: serverScore, found_words: validWords })
+      .eq("match_id", matchId)
+      .eq("user_id", userId)
+      .select("score, found_words")
+      .maybeSingle()
+
+    if (updateError) {
+      return { success: false, error: updateError.message }
+    }
+    if (!updated) {
+      return { success: false, error: "Participant not found" }
+    }
+
+    return { success: true, data: { score: serverScore, foundWords: validWords } }
+  } catch (error) {
+    console.error("Error in syncLiveMatchProgress:", error)
+    return { success: false, error: "Failed to sync live match progress" }
   }
 }
 

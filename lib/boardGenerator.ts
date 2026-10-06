@@ -113,6 +113,30 @@ class BoardSolver {
   }
 }
 
+/**
+ * Re-validates candidate words against an already-persisted board using the
+ * same trie/DFS path rules as board generation. The candidate list can be
+ * prefiltered by the caller's dictionary/rule policy.
+ */
+export function findWordsOnBoard(board: string[][], words: string[]): Set<string> {
+  if (board.length !== 4 || board.some((row) => row.length !== 4)) {
+    return new Set()
+  }
+
+  const trie = new TrieNode()
+  const normalizedWords = new Set(
+    words
+      .map((word) => word.trim().toUpperCase())
+      .filter((word) => word.length >= 3),
+  )
+  normalizedWords.forEach((word) => trie.addWord(word))
+
+  const normalizedBoard = board.map((row) => row.map((letter) => letter.toUpperCase()))
+  const solver = new BoardSolver(normalizedBoard, trie)
+  solver.findAllWords()
+  return new Set(solver.answers)
+}
+
 // Stateful Linear Congruential Generator for deterministic seeded random
 class SeededRandom {
   private seed: number
