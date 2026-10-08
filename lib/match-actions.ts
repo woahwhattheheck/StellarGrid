@@ -1,5 +1,6 @@
 "use server"
 
+import { randomUUID } from "node:crypto"
 import { supabase } from "@/lib/supabase"
 import { supabaseAdmin } from "@/lib/supabase-admin"
 import { getEscrowClient } from "@/lib/soroban/escrowClient"
@@ -169,6 +170,8 @@ export async function confirmStake(matchId: string, userId: string) {
         .from("matches")
         .update({ status: "active", started_at: startedAt.toISOString(), ends_at: endsAt.toISOString() })
         .eq("id", matchId)
+        .eq("status", "awaiting_stakes")
+        .eq("reconciliation_state", "idle")
         .select()
         .single()
 
@@ -234,10 +237,241 @@ export async function submitScore(
   }
 }
 
+type ReconciliationAction = "settle" | "refund"
+type ReconciliationExpectedStatus = "active" | "awaiting_stakes"
+
+interface ReconciliationClaim {
+  acquired: boolean
+  current_status: string
+  claim_state: "idle" | "claimed" | "ambiguous" | "complete"
+  claim_token: string | null
+  action: ReconciliationAction | null
+  expected_status: ReconciliationExpectedStatus | null
+  winner_user_id: string | null
+  attempted_at: string | null
+}
+
+function rpcReturnedTrue(data: unknown): boolean {
+  return data === true || (Array.isArray(data) && data[0] === true)
+}
+
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+async function claimReconciliation(
+  matchId: string,
+  expectedStatus: ReconciliationExpectedStatus,
+  action: ReconciliationAction,
+  winnerUserId: string | null,
+): Promise<ReconciliationClaim> {
+  const claimToken = randomUUID()
+  const { data, error } = await supabaseAdmin.rpc("claim_match_reconciliation", {
+    p_match_id: matchId,
+    p_expected_status: expectedStatus,
+    p_action: action,
+    p_winner_user_id: winnerUserId,
+    p_claim_token: claimToken,
+  })
+
+  if (error) {
+    throw new Error(`Failed to claim reconciliation: ${error.message}`)
+  }
+
+  const row = (Array.isArray(data) ? data[0] : data) as ReconciliationClaim | null
+  if (!row) {
+    throw new Error("Failed to claim reconciliation: match not found")
+  }
+  return row
+}
+
+async function releaseUnattemptedClaim(matchId: string, claimToken: string): Promise<void> {
+  await supabaseAdmin.rpc("release_unattempted_match_reconciliation", {
+    p_match_id: matchId,
+    p_claim_token: claimToken,
+  })
+}
+
+async function markClaimAttempted(matchId: string, claimToken: string): Promise<{ success: boolean; error?: string }> {
+  const { data, error } = await supabaseAdmin.rpc("mark_match_reconciliation_attempted", {
+    p_match_id: matchId,
+    p_claim_token: claimToken,
+  })
+  if (error) return { success: false, error: error.message }
+  return { success: rpcReturnedTrue(data) }
+}
+
+async function markClaimAmbiguous(matchId: string, claimToken: string, error: string): Promise<void> {
+  await supabaseAdmin.rpc("mark_match_reconciliation_ambiguous", {
+    p_match_id: matchId,
+    p_claim_token: claimToken,
+    p_error: error.slice(0, 1000),
+  })
+}
+
+function claimEventType(claim: ReconciliationClaim): string {
+  if (claim.action === "settle") return "settled"
+  return claim.expected_status === "awaiting_stakes" ? "stake_deadline_refunded" : "tie_refunded"
+}
+
+async function completeClaim(
+  matchId: string,
+  claim: ReconciliationClaim,
+  txHash: string | null,
+  recovered: boolean,
+) {
+  if (!claim.claim_token || !claim.action) {
+    return { success: false, error: "Reconciliation claim metadata is incomplete" }
+  }
+
+  const terminalStatus = claim.action === "settle" ? "settled" : "refunded"
+  const { data, error } = await supabaseAdmin.rpc("complete_match_reconciliation", {
+    p_match_id: matchId,
+    p_claim_token: claim.claim_token,
+    p_terminal_status: terminalStatus,
+    p_tx_hash: txHash,
+  })
+
+  if (error || !rpcReturnedTrue(data)) {
+    const message = error?.message ?? "Reconciliation claim no longer owns finalization"
+    await markClaimAmbiguous(matchId, claim.claim_token, `Provider completed but DB finalization failed: ${message}`)
+    return {
+      success: false,
+      reconciliationPending: true,
+      error: "Provider outcome requires database reconciliation; automatic resubmission is disabled",
+    }
+  }
+
+  await logMatchEvent(matchId, claimEventType(claim), {
+    winnerUserId: claim.winner_user_id,
+    txHash,
+    recovered,
+  })
+
+  const { data: match } = await supabaseAdmin.from("matches").select("*").eq("id", matchId).single()
+  return { success: true, data: match, recovered }
+}
+
+async function recoverProviderOutcome(matchId: string, claim: ReconciliationClaim) {
+  if (!claim.claim_token || !claim.action || !claim.attempted_at) {
+    return { success: true, alreadyReconciling: true }
+  }
+
+  try {
+    const escrowClient = await getEscrowClient()
+    const providerState = await escrowClient.getMatchState(matchId)
+    const expectedProviderStatus = claim.action === "settle" ? "Settled" : "Refunded"
+
+    if (providerState.status !== expectedProviderStatus) {
+      await markClaimAmbiguous(
+        matchId,
+        claim.claim_token,
+        `Provider reports ${providerState.status}; expected ${expectedProviderStatus}. Automatic retry suppressed.`,
+      )
+      return {
+        success: false,
+        reconciliationPending: true,
+        providerStatus: providerState.status,
+        error: "Provider outcome is not terminal; automatic resubmission is disabled",
+      }
+    }
+
+    if (
+      claim.action === "settle" &&
+      providerState.winner &&
+      providerState.winner !== claim.winner_user_id
+    ) {
+      await markClaimAmbiguous(matchId, claim.claim_token, "Provider winner conflicts with the durable claim")
+      return {
+        success: false,
+        reconciliationPending: true,
+        error: "Provider winner conflicts with the durable reconciliation claim",
+      }
+    }
+
+    return await completeClaim(matchId, claim, providerState.txHash ?? null, true)
+  } catch (error) {
+    await markClaimAmbiguous(matchId, claim.claim_token, `Provider state read failed: ${describeError(error)}`)
+    return {
+      success: false,
+      reconciliationPending: true,
+      error: "Provider state could not be verified; automatic resubmission is disabled",
+    }
+  }
+}
+
+async function executeClaimedOperation(matchId: string, claim: ReconciliationClaim) {
+  if (!claim.claim_token || !claim.action) {
+    return { success: false, error: "Reconciliation claim metadata is incomplete" }
+  }
+
+  let escrowClient
+  try {
+    escrowClient = await getEscrowClient()
+  } catch (error) {
+    await releaseUnattemptedClaim(matchId, claim.claim_token)
+    return { success: false, error: describeError(error) }
+  }
+
+  const attempted = await markClaimAttempted(matchId, claim.claim_token)
+  if (!attempted.success) {
+    // No provider call has happened. Release succeeds only when the attempted
+    // marker definitely did not commit; an uncertain committed marker stays
+    // held for provider-state recovery rather than risking a duplicate call.
+    await releaseUnattemptedClaim(matchId, claim.claim_token)
+    return {
+      success: false,
+      reconciliationPending: true,
+      error: attempted.error ?? "Could not durably mark the provider attempt",
+    }
+  }
+
+  try {
+    const result = claim.action === "settle"
+      ? await escrowClient.settle(matchId, claim.winner_user_id as string)
+      : await escrowClient.refundTimeout(matchId)
+    return await completeClaim(matchId, claim, result.txHash, false)
+  } catch (error) {
+    await markClaimAmbiguous(matchId, claim.claim_token, `Provider call outcome is ambiguous: ${describeError(error)}`)
+    return {
+      success: false,
+      reconciliationPending: true,
+      error: "Provider call outcome is ambiguous; automatic resubmission is disabled",
+    }
+  }
+}
+
+async function runMatchReconciliation(
+  matchId: string,
+  expectedStatus: ReconciliationExpectedStatus,
+  action: ReconciliationAction,
+  winnerUserId: string | null,
+) {
+  const claim = await claimReconciliation(matchId, expectedStatus, action, winnerUserId)
+
+  if (claim.acquired) {
+    return await executeClaimedOperation(matchId, claim)
+  }
+
+  if (claim.current_status === "settled" || claim.current_status === "refunded") {
+    return { success: true, alreadySettled: true }
+  }
+
+  if (claim.current_status !== expectedStatus) {
+    return { success: true, noActionNeeded: true }
+  }
+
+  if (claim.claim_state === "claimed" && !claim.attempted_at) {
+    // A concurrent caller owns the short pre-provider window. Only claims that
+    // never reached the attempted marker can be reclaimed after the DB-enforced
+    // stale interval.
+    return { success: true, alreadyReconciling: true }
+  }
+
+  return await recoverProviderOutcome(matchId, claim)
+}
+
 export async function settleMatch(matchId: string) {
-  // Idempotent: settling an already-settled/refunded match is a no-op so
-  // callers (submitScore, the settle API route, the reconcile sweep) can
-  // all safely call this without coordinating who "owns" the transition.
   const { data: existing } = await supabaseAdmin.from("matches").select("status").eq("id", matchId).single()
   if (existing && (existing.status === "settled" || existing.status === "refunded")) {
     return { success: true, alreadySettled: true }
@@ -254,39 +488,12 @@ export async function settleMatch(matchId: string) {
 
   const [a, b] = participants
   const winner = a.score === b.score ? null : a.score > b.score ? a : b
-
-  const escrowClient = await getEscrowClient()
-
-  if (!winner) {
-    // Tie: refund both rather than an arbitrary winner-takes-all pick.
-    await escrowClient.refundTimeout(matchId)
-    const { data, error } = await supabaseAdmin
-      .from("matches")
-      .update({ status: "refunded" })
-      .eq("id", matchId)
-      .select()
-      .single()
-
-    await logMatchEvent(matchId, "tie_refunded", {})
-    return { success: !error, data, error: error?.message }
-  }
-
-  const { txHash } = await escrowClient.settle(matchId, winner.user_id)
-
-  const { data, error } = await supabaseAdmin
-    .from("matches")
-    .update({ status: "settled", winner_user_id: winner.user_id, payout_tx_hash: txHash })
-    .eq("id", matchId)
-    .select()
-    .single()
-
-  if (error) {
-    return { success: false, error: error.message }
-  }
-
-  await logMatchEvent(matchId, "settled", { winnerUserId: winner.user_id, txHash })
-
-  return { success: true, data }
+  return await runMatchReconciliation(
+    matchId,
+    "active",
+    winner ? "settle" : "refund",
+    winner?.user_id ?? null,
+  )
 }
 
 export async function getMatch(matchId: string) {
@@ -343,24 +550,17 @@ export async function reconcileMatch(matchId: string) {
 
       const bothStaked = participants?.length === 2 && participants.every((p) => p.staked_at)
       if (!bothStaked) {
-        const escrowClient = await getEscrowClient()
-        await escrowClient.refundTimeout(matchId)
-        const { data, error: updateError } = await supabaseAdmin
-          .from("matches")
-          .update({ status: "refunded" })
-          .eq("id", matchId)
-          .select()
-          .single()
-
-        await logMatchEvent(matchId, "stake_deadline_refunded", {})
-        return { success: !updateError, data, error: updateError?.message }
+        return await runMatchReconciliation(matchId, "awaiting_stakes", "refund", null)
       }
     }
 
     return { success: true, data: match, noActionNeeded: true }
   } catch (error) {
     console.error("Error in reconcileMatch:", error)
-    return { success: false, error: "Failed to reconcile match" }
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : "Failed to reconcile match",
+    }
   }
 }
 

@@ -20,6 +20,7 @@ interface MockMatch {
   playerBDeposited: boolean
   status: EscrowMatchState["status"]
   winner?: string
+  txHash?: string
 }
 
 const matches = new Map<string, MockMatch>()
@@ -73,9 +74,11 @@ export const mockEscrowClient: EscrowClient = {
     if (!match) {
       throw new Error(`mockEscrowClient: unknown match ${matchId}`)
     }
+    const txHash = fakeTxHash()
     match.status = "Settled"
     match.winner = winner
-    return { txHash: fakeTxHash() }
+    match.txHash = txHash
+    return { txHash }
   },
 
   async refundTimeout(matchId: string) {
@@ -83,8 +86,10 @@ export const mockEscrowClient: EscrowClient = {
     if (!match) {
       throw new Error(`mockEscrowClient: unknown match ${matchId}`)
     }
+    const txHash = fakeTxHash()
     match.status = "Refunded"
-    return { txHash: fakeTxHash() }
+    match.txHash = txHash
+    return { txHash }
   },
 
   async getMatchState(matchId: string): Promise<EscrowMatchState> {
@@ -98,6 +103,7 @@ export const mockEscrowClient: EscrowClient = {
       playerADeposited: match.playerADeposited,
       playerBDeposited: match.playerBDeposited,
       winner: match.winner,
+      txHash: match.txHash,
     }
   },
 }

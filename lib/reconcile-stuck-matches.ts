@@ -34,8 +34,9 @@ async function listExpiredMatchIds(status: MatchStatus, deadlineColumn: Deadline
  * Candidate discovery is paginated so the scheduled sweep does not silently
  * stop at Supabase's row-return limit. Each match is reconciled sequentially:
  * escrow operations stay bounded, while one failed match does not prevent the
- * rest of the sweep from progressing. Failed matches remain eligible for the
- * next cron run because reconcileMatch only advances state on success.
+ * rest of the sweep from progressing. A later run can finalize a provider
+ * operation from provider state, while ambiguous operations stay durably held
+ * and are never blindly resubmitted.
  */
 export async function reconcileStuckMatches(now = new Date()) {
   try {

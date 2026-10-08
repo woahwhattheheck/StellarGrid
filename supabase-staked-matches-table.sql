@@ -24,9 +24,53 @@ CREATE TABLE IF NOT EXISTS public.matches (
   ends_at TIMESTAMP WITH TIME ZONE,
   winner_user_id UUID REFERENCES auth.users(id) ON DELETE SET NULL,
   payout_tx_hash TEXT,
+  reconciliation_state TEXT NOT NULL DEFAULT 'idle',
+  reconciliation_action TEXT,
+  reconciliation_expected_status TEXT,
+  reconciliation_claim_token UUID,
+  reconciliation_claimed_at TIMESTAMP WITH TIME ZONE,
+  reconciliation_attempted_at TIMESTAMP WITH TIME ZONE,
+  reconciliation_winner_user_id UUID REFERENCES auth.users(id) ON DELETE SET NULL,
+  reconciliation_tx_hash TEXT,
+  reconciliation_error TEXT,
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-  updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  CONSTRAINT matches_reconciliation_state_check
+    CHECK (reconciliation_state IN ('idle', 'claimed', 'ambiguous', 'complete')),
+  CONSTRAINT matches_reconciliation_action_check
+    CHECK (reconciliation_action IS NULL OR reconciliation_action IN ('settle', 'refund')),
+  CONSTRAINT matches_reconciliation_expected_status_check
+    CHECK (reconciliation_expected_status IS NULL OR reconciliation_expected_status IN ('active', 'awaiting_stakes'))
 );
+
+-- Existing deployments need the durable-claim columns as well; CREATE TABLE IF
+-- NOT EXISTS does not add newly declared columns.
+ALTER TABLE public.matches ADD COLUMN IF NOT EXISTS reconciliation_state TEXT NOT NULL DEFAULT 'idle';
+ALTER TABLE public.matches ADD COLUMN IF NOT EXISTS reconciliation_action TEXT;
+ALTER TABLE public.matches ADD COLUMN IF NOT EXISTS reconciliation_expected_status TEXT;
+ALTER TABLE public.matches ADD COLUMN IF NOT EXISTS reconciliation_claim_token UUID;
+ALTER TABLE public.matches ADD COLUMN IF NOT EXISTS reconciliation_claimed_at TIMESTAMP WITH TIME ZONE;
+ALTER TABLE public.matches ADD COLUMN IF NOT EXISTS reconciliation_attempted_at TIMESTAMP WITH TIME ZONE;
+ALTER TABLE public.matches ADD COLUMN IF NOT EXISTS reconciliation_winner_user_id UUID REFERENCES auth.users(id) ON DELETE SET NULL;
+ALTER TABLE public.matches ADD COLUMN IF NOT EXISTS reconciliation_tx_hash TEXT;
+ALTER TABLE public.matches ADD COLUMN IF NOT EXISTS reconciliation_error TEXT;
+
+DO $
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'matches_reconciliation_state_check' AND conrelid = 'public.matches'::regclass) THEN
+    ALTER TABLE public.matches ADD CONSTRAINT matches_reconciliation_state_check
+      CHECK (reconciliation_state IN ('idle', 'claimed', 'ambiguous', 'complete'));
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'matches_reconciliation_action_check' AND conrelid = 'public.matches'::regclass) THEN
+    ALTER TABLE public.matches ADD CONSTRAINT matches_reconciliation_action_check
+      CHECK (reconciliation_action IS NULL OR reconciliation_action IN ('settle', 'refund'));
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'matches_reconciliation_expected_status_check' AND conrelid = 'public.matches'::regclass) THEN
+    ALTER TABLE public.matches ADD CONSTRAINT matches_reconciliation_expected_status_check
+      CHECK (reconciliation_expected_status IS NULL OR reconciliation_expected_status IN ('active', 'awaiting_stakes'));
+  END IF;
+END
+$;
 
 -- 2. Match participants table
 CREATE TABLE IF NOT EXISTS public.match_participants (
@@ -131,3 +175,237 @@ CREATE POLICY "Participants can view events for their matches" ON public.match_e
 
 CREATE POLICY "No direct client inserts to match_events" ON public.match_events
   FOR INSERT WITH CHECK (false);
+
+-- ---------------------------------------------------------------------------
+-- Durable reconciliation claim/CAS (service role only)
+-- ---------------------------------------------------------------------------
+--
+-- The first UPDATE is the concurrency proof: PostgreSQL row locking plus the
+-- reconciliation_state predicate permits exactly one caller to move idle ->
+-- claimed. A stale claim is reclaimable only when attempted_at is still NULL,
+-- which proves this code never crossed the provider-call fence. Once attempted,
+-- every retry must read provider state and may only finalize the expected
+-- terminal result; it must never issue the money-moving call again blindly.
+
+CREATE OR REPLACE FUNCTION public.claim_match_reconciliation(
+  p_match_id UUID,
+  p_expected_status TEXT,
+  p_action TEXT,
+  p_winner_user_id UUID,
+  p_claim_token UUID
+)
+RETURNS TABLE (
+  acquired BOOLEAN,
+  current_status TEXT,
+  claim_state TEXT,
+  claim_token UUID,
+  action TEXT,
+  expected_status TEXT,
+  winner_user_id UUID,
+  attempted_at TIMESTAMP WITH TIME ZONE
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  claimed public.matches%ROWTYPE;
+BEGIN
+  IF p_expected_status NOT IN ('active', 'awaiting_stakes') THEN
+    RAISE EXCEPTION 'invalid reconciliation status %', p_expected_status;
+  END IF;
+  IF p_action NOT IN ('settle', 'refund') THEN
+    RAISE EXCEPTION 'invalid reconciliation action %', p_action;
+  END IF;
+  IF p_action = 'settle' AND p_winner_user_id IS NULL THEN
+    RAISE EXCEPTION 'settlement requires a winner';
+  END IF;
+
+  UPDATE public.matches AS m
+  SET reconciliation_state = 'claimed',
+      reconciliation_action = p_action,
+      reconciliation_expected_status = p_expected_status,
+      reconciliation_claim_token = p_claim_token,
+      reconciliation_claimed_at = clock_timestamp(),
+      reconciliation_attempted_at = NULL,
+      reconciliation_winner_user_id = CASE WHEN p_action = 'settle' THEN p_winner_user_id ELSE NULL END,
+      reconciliation_tx_hash = NULL,
+      reconciliation_error = NULL,
+      updated_at = clock_timestamp()
+  WHERE m.id = p_match_id
+    AND m.status = p_expected_status
+    AND (
+      m.reconciliation_state = 'idle'
+      OR (
+        m.reconciliation_state = 'claimed'
+        AND m.reconciliation_attempted_at IS NULL
+        AND m.reconciliation_claimed_at < clock_timestamp() - INTERVAL '5 minutes'
+      )
+    )
+  RETURNING m.* INTO claimed;
+
+  IF FOUND THEN
+    RETURN QUERY SELECT
+      TRUE,
+      claimed.status,
+      claimed.reconciliation_state,
+      claimed.reconciliation_claim_token,
+      claimed.reconciliation_action,
+      claimed.reconciliation_expected_status,
+      claimed.reconciliation_winner_user_id,
+      claimed.reconciliation_attempted_at;
+    RETURN;
+  END IF;
+
+  RETURN QUERY
+  SELECT
+    FALSE,
+    m.status,
+    m.reconciliation_state,
+    m.reconciliation_claim_token,
+    m.reconciliation_action,
+    m.reconciliation_expected_status,
+    m.reconciliation_winner_user_id,
+    m.reconciliation_attempted_at
+  FROM public.matches AS m
+  WHERE m.id = p_match_id;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.release_unattempted_match_reconciliation(
+  p_match_id UUID,
+  p_claim_token UUID
+)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  changed INTEGER;
+BEGIN
+  UPDATE public.matches
+  SET reconciliation_state = 'idle',
+      reconciliation_action = NULL,
+      reconciliation_expected_status = NULL,
+      reconciliation_claim_token = NULL,
+      reconciliation_claimed_at = NULL,
+      reconciliation_winner_user_id = NULL,
+      reconciliation_error = NULL,
+      updated_at = clock_timestamp()
+  WHERE id = p_match_id
+    AND reconciliation_state = 'claimed'
+    AND reconciliation_claim_token = p_claim_token
+    AND reconciliation_attempted_at IS NULL;
+  GET DIAGNOSTICS changed = ROW_COUNT;
+  RETURN changed = 1;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.mark_match_reconciliation_attempted(
+  p_match_id UUID,
+  p_claim_token UUID
+)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  changed INTEGER;
+BEGIN
+  UPDATE public.matches
+  SET reconciliation_attempted_at = clock_timestamp(),
+      updated_at = clock_timestamp()
+  WHERE id = p_match_id
+    AND reconciliation_state = 'claimed'
+    AND reconciliation_claim_token = p_claim_token
+    AND reconciliation_attempted_at IS NULL;
+  GET DIAGNOSTICS changed = ROW_COUNT;
+  RETURN changed = 1;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.mark_match_reconciliation_ambiguous(
+  p_match_id UUID,
+  p_claim_token UUID,
+  p_error TEXT
+)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  changed INTEGER;
+BEGIN
+  UPDATE public.matches
+  SET reconciliation_state = 'ambiguous',
+      reconciliation_error = LEFT(p_error, 1000),
+      updated_at = clock_timestamp()
+  WHERE id = p_match_id
+    AND reconciliation_state IN ('claimed', 'ambiguous')
+    AND reconciliation_claim_token = p_claim_token
+    AND reconciliation_attempted_at IS NOT NULL;
+  GET DIAGNOSTICS changed = ROW_COUNT;
+  RETURN changed = 1;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.complete_match_reconciliation(
+  p_match_id UUID,
+  p_claim_token UUID,
+  p_terminal_status TEXT,
+  p_tx_hash TEXT
+)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  changed INTEGER;
+BEGIN
+  IF p_terminal_status NOT IN ('settled', 'refunded') THEN
+    RAISE EXCEPTION 'invalid terminal reconciliation status %', p_terminal_status;
+  END IF;
+
+  UPDATE public.matches
+  SET status = p_terminal_status,
+      winner_user_id = CASE
+        WHEN reconciliation_action = 'settle' THEN reconciliation_winner_user_id
+        ELSE NULL
+      END,
+      payout_tx_hash = CASE
+        WHEN reconciliation_action = 'settle' THEN COALESCE(p_tx_hash, payout_tx_hash)
+        ELSE payout_tx_hash
+      END,
+      reconciliation_tx_hash = COALESCE(p_tx_hash, reconciliation_tx_hash),
+      reconciliation_state = 'complete',
+      reconciliation_error = NULL,
+      updated_at = clock_timestamp()
+  WHERE id = p_match_id
+    AND reconciliation_claim_token = p_claim_token
+    AND reconciliation_state IN ('claimed', 'ambiguous')
+    AND reconciliation_attempted_at IS NOT NULL
+    AND status = reconciliation_expected_status
+    AND (
+      (reconciliation_action = 'settle' AND p_terminal_status = 'settled')
+      OR (reconciliation_action = 'refund' AND p_terminal_status = 'refunded')
+    );
+  GET DIAGNOSTICS changed = ROW_COUNT;
+  RETURN changed = 1;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.claim_match_reconciliation(UUID, TEXT, TEXT, UUID, UUID) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.release_unattempted_match_reconciliation(UUID, UUID) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.mark_match_reconciliation_attempted(UUID, UUID) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.mark_match_reconciliation_ambiguous(UUID, UUID, TEXT) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.complete_match_reconciliation(UUID, UUID, TEXT, TEXT) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.claim_match_reconciliation(UUID, TEXT, TEXT, UUID, UUID) TO service_role;
+GRANT EXECUTE ON FUNCTION public.release_unattempted_match_reconciliation(UUID, UUID) TO service_role;
+GRANT EXECUTE ON FUNCTION public.mark_match_reconciliation_attempted(UUID, UUID) TO service_role;
+GRANT EXECUTE ON FUNCTION public.mark_match_reconciliation_ambiguous(UUID, UUID, TEXT) TO service_role;
+GRANT EXECUTE ON FUNCTION public.complete_match_reconciliation(UUID, UUID, TEXT, TEXT) TO service_role;
+

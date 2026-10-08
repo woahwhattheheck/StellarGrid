@@ -18,6 +18,8 @@ export interface EscrowMatchState {
   playerADeposited: boolean
   playerBDeposited: boolean
   winner?: string
+  /** Provider transaction hash when the provider exposes it during recovery. */
+  txHash?: string
 }
 
 export interface CreateMatchEscrowParams {
