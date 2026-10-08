@@ -9,14 +9,22 @@ type DeadlineColumn = "ends_at" | "stake_deadline_at"
 async function listExpiredMatchIds(status: MatchStatus, deadlineColumn: DeadlineColumn, cutoff: string) {
   const ids: string[] = []
 
-  for (let from = 0; ; from += PAGE_SIZE) {
-    const { data, error } = await supabaseAdmin
+  let lastId: string | null = null
+
+  for (;;) {
+    let query = supabaseAdmin
       .from("matches")
       .select("id")
       .eq("status", status)
       .lt(deadlineColumn, cutoff)
       .order("id", { ascending: true })
-      .range(from, from + PAGE_SIZE - 1)
+      .limit(PAGE_SIZE)
+
+    if (lastId !== null) {
+      query = query.gt("id", lastId)
+    }
+
+    const { data, error } = await query
 
     if (error) {
       throw new Error(`Failed to list expired ${status} matches: ${error.message}`)
@@ -25,6 +33,8 @@ async function listExpiredMatchIds(status: MatchStatus, deadlineColumn: Deadline
     const page = data ?? []
     ids.push(...page.map((match) => match.id as string))
     if (page.length < PAGE_SIZE) return ids
+
+    lastId = page[page.length - 1].id as string
   }
 }
 
