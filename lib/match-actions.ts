@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto"
 import { supabase } from "@/lib/supabase"
 import { supabaseAdmin } from "@/lib/supabase-admin"
 import { getEscrowClient } from "@/lib/soroban/escrowClient"
+import { assessRecoveredProviderOutcome } from "@/lib/reconciliation-recovery-policy.mjs"
 import { generateRandomSeed, generateBoardFromSeed } from "@/lib/boardGenerator"
 import { words3 } from "@/utils/words3"
 import { obfuscateWords } from "@/utils/wordObfuscation"
@@ -360,32 +361,18 @@ async function recoverProviderOutcome(matchId: string, claim: ReconciliationClai
   try {
     const escrowClient = await getEscrowClient()
     const providerState = await escrowClient.getMatchState(matchId)
-    const expectedProviderStatus = claim.action === "settle" ? "Settled" : "Refunded"
+    const assessment = assessRecoveredProviderOutcome(
+      { action: claim.action, winnerUserId: claim.winner_user_id },
+      { status: providerState.status, winner: providerState.winner },
+    )
 
-    if (providerState.status !== expectedProviderStatus) {
-      await markClaimAmbiguous(
-        matchId,
-        claim.claim_token,
-        `Provider reports ${providerState.status}; expected ${expectedProviderStatus}. Automatic retry suppressed.`,
-      )
+    if (!assessment.canFinalize) {
+      await markClaimAmbiguous(matchId, claim.claim_token, assessment.reason)
       return {
         success: false,
         reconciliationPending: true,
         providerStatus: providerState.status,
-        error: "Provider outcome is not terminal; automatic resubmission is disabled",
-      }
-    }
-
-    if (
-      claim.action === "settle" &&
-      providerState.winner &&
-      providerState.winner !== claim.winner_user_id
-    ) {
-      await markClaimAmbiguous(matchId, claim.claim_token, "Provider winner conflicts with the durable claim")
-      return {
-        success: false,
-        reconciliationPending: true,
-        error: "Provider winner conflicts with the durable reconciliation claim",
+        error: assessment.reason,
       }
     }
 
