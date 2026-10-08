@@ -55,7 +55,7 @@ ALTER TABLE public.matches ADD COLUMN IF NOT EXISTS reconciliation_winner_user_i
 ALTER TABLE public.matches ADD COLUMN IF NOT EXISTS reconciliation_tx_hash TEXT;
 ALTER TABLE public.matches ADD COLUMN IF NOT EXISTS reconciliation_error TEXT;
 
-DO $
+DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'matches_reconciliation_state_check' AND conrelid = 'public.matches'::regclass) THEN
     ALTER TABLE public.matches ADD CONSTRAINT matches_reconciliation_state_check
@@ -70,7 +70,7 @@ BEGIN
       CHECK (reconciliation_expected_status IS NULL OR reconciliation_expected_status IN ('active', 'awaiting_stakes'));
   END IF;
 END
-$;
+$$;
 
 -- 2. Match participants table
 CREATE TABLE IF NOT EXISTS public.match_participants (
